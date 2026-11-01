@@ -44,6 +44,9 @@ type DiskReport struct {
 	AwaitMs  float64 `json:"await_ms"`
 	Queue    float64 `json:"queue_depth"`
 	Util     float64 `json:"util_pct"`
+
+	Active   bool   `json:"-"` // any I/O in this window
+	Lifetime uint64 `json:"-"` // sectors moved since boot: a stable sort key
 }
 
 type IOReport struct {
@@ -52,7 +55,7 @@ type IOReport struct {
 	Trend     int
 
 	HasRates bool
-	Disks    []DiskReport // active devices, busiest first
+	Disks    []DiskReport // every device, busiest-since-boot first (stable)
 	Idle     int          // devices with no I/O in the window
 }
 
@@ -132,40 +135,37 @@ func probeIO(psiPath string) IOSample {
 func assessIO(c *config, prev *IOSample, cur IOSample, dt float64) IOReport {
 	var r IOReport
 
-	if prev != nil && dt > 0.05 && prev.HasDisks && cur.HasDisks {
-		r.HasRates = true
-		ms := dt * 1000
-		for name, b := range cur.Disks {
-			a, ok := prev.Disks[name]
-			if !ok {
-				continue
-			}
+	// Every device gets a row, idle or not, ordered by lifetime traffic.
+	// That order barely changes while strain runs, so the table neither
+	// grows and shrinks nor reshuffles as disks go busy and quiet.
+	r.HasRates = prev != nil && dt > 0.05 && prev.HasDisks && cur.HasDisks
+	ms := dt * 1000
+	for name, b := range cur.Disks {
+		d := DiskReport{Name: name, Lifetime: b.rsect + b.wsect}
+		if a, ok := prev.diskOK(name); ok && r.HasRates {
 			ops := float64(sat(b.reads, a.reads) + sat(b.writes, a.writes))
 			busy := float64(sat(b.ioms, a.ioms))
-			if ops == 0 && busy == 0 {
-				r.Idle++
-				continue
-			}
-			d := DiskReport{
-				Name:     name,
-				IOPS:     ops / dt,
-				ReadBps:  float64(sat(b.rsect, a.rsect)) * 512 / dt,
-				WriteBps: float64(sat(b.wsect, a.wsect)) * 512 / dt,
-				Queue:    float64(sat(b.weightedMs, a.weightedMs)) / ms,
-				Util:     clamp(100*busy/ms, 0, 100),
-			}
+			d.Active = ops > 0 || busy > 0
+			d.IOPS = ops / dt
+			d.ReadBps = float64(sat(b.rsect, a.rsect)) * 512 / dt
+			d.WriteBps = float64(sat(b.wsect, a.wsect)) * 512 / dt
+			d.Queue = float64(sat(b.weightedMs, a.weightedMs)) / ms
+			d.Util = clamp(100*busy/ms, 0, 100)
 			if ops > 0 {
 				d.AwaitMs = float64(sat(b.rms, a.rms)+sat(b.wms, a.wms)) / ops
 			}
-			r.Disks = append(r.Disks, d)
 		}
-		sort.Slice(r.Disks, func(i, j int) bool {
-			if r.Disks[i].Queue != r.Disks[j].Queue {
-				return r.Disks[i].Queue > r.Disks[j].Queue
-			}
-			return r.Disks[i].Name < r.Disks[j].Name
-		})
+		if !d.Active && r.HasRates {
+			r.Idle++
+		}
+		r.Disks = append(r.Disks, d)
 	}
+	sort.Slice(r.Disks, func(i, j int) bool {
+		if r.Disks[i].Lifetime != r.Disks[j].Lifetime {
+			return r.Disks[i].Lifetime > r.Disks[j].Lifetime
+		}
+		return r.Disks[i].Name < r.Disks[j].Name
+	})
 
 	switch {
 	case cur.HasPSI:
@@ -209,4 +209,12 @@ func ioExplain(r *IOReport, hasPSI bool) string {
 		"Tasks regularly stall waiting on storage.",
 		"Storage can't keep up; work is waiting on I/O.",
 	}[r.State]
+}
+
+func (s *IOSample) diskOK(name string) (diskStat, bool) {
+	if s == nil {
+		return diskStat{}, false
+	}
+	d, ok := s.Disks[name]
+	return d, ok
 }

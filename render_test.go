@@ -211,7 +211,7 @@ func TestAssessIO(t *testing.T) {
 		"sdb": {},
 	}}
 	r := assessIO(testCfg, &prev, cur, 2)
-	if len(r.Disks) != 1 || r.Idle != 1 {
+	if len(r.Disks) != 2 || r.Idle != 1 || !r.Disks[0].Active || r.Disks[1].Active {
 		t.Fatalf("disks=%+v idle=%d", r.Disks, r.Idle)
 	}
 	d := r.Disks[0]
@@ -220,5 +220,51 @@ func TestAssessIO(t *testing.T) {
 	}
 	if !r.Estimated || r.State != StateOK {
 		t.Errorf("no-PSI estimate: %+v", r)
+	}
+}
+
+// The disk table must keep one height whether devices are busy or idle,
+// and an active device beyond the visible slots must still be shown.
+func TestDiskTableStableHeight(t *testing.T) {
+	names := []string{"nvme0n1", "sda", "sdb", "sdc", "sdd", "sde"}
+	mk := func(active map[string]bool, rates bool) *IOReport {
+		r := &IOReport{HasRates: rates}
+		for i, n := range names {
+			d := DiskReport{Name: n, Lifetime: uint64(100 - i), Active: active[n]}
+			if d.Active {
+				d.IOPS, d.WriteBps, d.AwaitMs, d.Queue, d.Util = 900, 40*mib, 2, 1.2, 60
+			} else if rates {
+				r.Idle++
+			}
+			r.Disks = append(r.Disks, d)
+		}
+		return r
+	}
+	height := func(r *IOReport) int {
+		f := newFrame(88)
+		f.diskTable(r)
+		return len(f.out)
+	}
+	cases := []*IOReport{
+		mk(nil, false),
+		mk(nil, true),
+		mk(map[string]bool{"nvme0n1": true}, true),
+		mk(map[string]bool{"sde": true}, true),
+		mk(map[string]bool{"nvme0n1": true, "sda": true, "sdb": true, "sdc": true, "sde": true}, true),
+	}
+	want := height(cases[0])
+	for i, r := range cases {
+		if h := height(r); h != want {
+			t.Errorf("case %d: height %d, want %d", i, h, want)
+		}
+	}
+	// sde (lowest lifetime) is active: it must replace an idle slot.
+	shown := pickDisks(cases[3].Disks, maxDisks)
+	found := false
+	for _, d := range shown {
+		found = found || d.Name == "sde"
+	}
+	if !found {
+		t.Errorf("active sde hidden: %+v", shown)
 	}
 }

@@ -141,7 +141,11 @@ Bands (`--io-bands A,B,C`):
 
 ### Disk activity (per-second deltas from `/proc/diskstats`)
 
-One row per active whole device, busiest first by queue depth, up to four.
+Four fixed rows, so the table keeps the same height whether disks are busy or
+idle. Rows go to the devices with the most traffic since boot, an order that
+barely changes while strain runs. Idle devices show dim dots instead of
+disappearing. If a device outside the four becomes active, it takes over an
+idle row so it is never hidden, and a "+N more devices" line notes the rest.
 Partitions, loop, ram, zram, floppy and optical devices are skipped.
 Device-mapper volumes show their dm name (`pve-root` rather than `dm-0`).
 
@@ -182,7 +186,7 @@ PATH is absolute or relative to `/sys/fs/cgroup`.
 
 `-j` prints one JSON object with `memory`, `cpu` and `io` sections, each
 carrying its own `state`, `stall` figures and supporting metrics (`io` lists
-every active device). The top-level `level` is `ok`, `warning` or `critical`:
+every device that was active during the window, plus an `idle_devices` count). The top-level `level` is `ok`, `warning` or `critical`:
 the worst of the three.
 
 `--check` prints one line with perfdata after the `|`:

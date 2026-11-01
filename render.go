@@ -796,17 +796,31 @@ func fmtMs(v float64) string {
 	return fmt.Sprintf("%.0f ms", v)
 }
 
-func (f *frame) diskTable(io *IOReport) {
-	if !io.HasRates {
-		f.row(newLn().put(cFaint, "measuring…"))
-		return
+// pickDisks fills a fixed number of slots, so the table keeps one height.
+// Slots go to the busiest-since-boot devices; if a device outside them
+// becomes active, it takes over the lowest idle slot so it is never hidden.
+func pickDisks(all []DiskReport, n int) []DiskReport {
+	if len(all) <= n {
+		return all
 	}
-	if len(io.Disks) == 0 {
-		msg := "no block devices found"
-		if io.Idle > 0 {
-			msg = fmt.Sprintf("all %d devices idle", io.Idle)
+	shown := append([]DiskReport(nil), all[:n]...)
+	for _, d := range all[n:] {
+		if !d.Active {
+			continue
 		}
-		f.row(newLn().put(cFaint, msg))
+		for i := n - 1; i >= 0; i-- {
+			if !shown[i].Active {
+				shown[i] = d
+				break
+			}
+		}
+	}
+	return shown
+}
+
+func (f *frame) diskTable(io *IOReport) {
+	if len(io.Disks) == 0 {
+		f.row(newLn().put(cFaint, "no block devices found"))
 		return
 	}
 
@@ -821,14 +835,33 @@ func (f *frame) diskTable(io *IOReport) {
 	}
 	f.row(head)
 
-	for _, d := range io.Disks[:min(len(io.Disks), maxDisks)] {
-		l := newLn().put(cText, fit(d.Name, diskCols[0].w-1)).to(diskCols[0].w)
+	shown := pickDisks(io.Disks, maxDisks)
+	for _, d := range shown {
+		live := io.HasRates && d.Active
+		nameCol := cText
+		if !live {
+			nameCol = cLabel
+		}
+		l := newLn().put(nameCol, fit(d.Name, diskCols[0].w-1)).to(diskCols[0].w)
 		cell := func(i int, text string, c rgb, bold bool) {
 			if bold {
 				l.bold(c, rjust(text, diskCols[i].w))
 			} else {
 				l.put(c, rjust(text, diskCols[i].w))
 			}
+		}
+		if !live {
+			// Same row height either way: idle and warming-up rows are dim
+			// placeholders rather than missing.
+			mark := "·"
+			if !io.HasRates {
+				mark = "…"
+			}
+			for i := 1; i < len(diskCols); i++ {
+				cell(i, mark, cFaint, false)
+			}
+			f.row(l)
+			continue
 		}
 		bytesCell := func(i int, b float64) {
 			if b <= 0 {
@@ -846,14 +879,23 @@ func (f *frame) diskTable(io *IOReport) {
 		f.row(l)
 	}
 
-	var more []string
-	if n := len(io.Disks) - maxDisks; n > 0 {
-		more = append(more, fmt.Sprintf("+%d more active", n))
-	}
-	if io.Idle > 0 {
-		more = append(more, fmt.Sprintf("%d idle", io.Idle))
-	}
-	if len(more) > 0 {
-		f.row(newLn().put(cFaint, strings.Join(more, " · ")))
+	// Present whenever devices outnumber slots, so it never pops in or out.
+	if hidden := len(io.Disks) - len(shown); hidden > 0 {
+		active := 0
+		for _, d := range io.Disks {
+			if d.Active {
+				active++
+			}
+		}
+		for _, d := range shown {
+			if d.Active {
+				active--
+			}
+		}
+		msg := fmt.Sprintf("+%d more devices", hidden)
+		if active > 0 {
+			msg += fmt.Sprintf(" · %d active", active)
+		}
+		f.row(newLn().put(cFaint, msg))
 	}
 }

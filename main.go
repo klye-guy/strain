@@ -501,6 +501,9 @@ func toJSON(r *Report) jsonReport {
 	}
 	q.Devices, q.Idle = []DiskReport{}, io.Idle
 	for _, d := range io.Disks {
+		if !d.Active {
+			continue
+		}
 		d.IOPS, d.AwaitMs, d.Queue, d.Util = round1(d.IOPS), round1(d.AwaitMs), round1(d.Queue), round1(d.Util)
 		d.ReadBps, d.WriteBps = math.Round(d.ReadBps), math.Round(d.WriteBps)
 		q.Devices = append(q.Devices, d)
