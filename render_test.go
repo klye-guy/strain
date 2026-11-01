@@ -26,7 +26,7 @@ var ansi = func(s string) string {
 
 type cpuSpec struct{ stall, busy, steal, waiting float64 }
 
-var testCfg = &config{memBands: [3]float64{1, 10, 25}, cpuBands: [3]float64{5, 20, 50}}
+var testCfg = &config{memBands: [3]float64{1, 10, 25}, cpuBands: [3]float64{5, 20, 50}, ioBands: [3]float64{5, 20, 50}}
 
 func synth(stall, full float64, realUsed, swapGiB float64, swapInMiB, refaultMiB float64, cs cpuSpec, source string) (*Report, *history) {
 	const gib = 1 << 30
@@ -50,7 +50,25 @@ func synth(stall, full float64, realUsed, swapGiB float64, swapInMiB, refaultMiB
 	curCPU.Usage = uint64(cs.busy / 100 * cores * 1e6)
 	curCPU.Throttled = uint64(cs.stall * 8000)
 
-	prev := Sample{At: t0, CPU: prevCPU}
+	// I/O scales with the memory stall so each preview shows a matching state.
+	disk := func(reads, writes, ms, weighted uint64) diskStat {
+		return diskStat{reads: reads, writes: writes, rsect: reads * 256, wsect: writes * 64,
+			rms: ms / 2, wms: ms / 2, ioms: min(ms, 1000), weightedMs: weighted}
+	}
+	ioLoad := uint64(stall*40) + 1
+	prevIO := IOSample{HasDisks: true, Disks: map[string]diskStat{
+		"nvme0n1": {}, "sda": {}, "pve-root": {}, "pve-data": {}, "sdb": {}, "sdc": {},
+	}}
+	curIO := IOSample{HasDisks: true, HasPSI: true,
+		Some: PSILine{stall * 1.4, stall, stall * 0.4}, Full: PSILine{stall * 0.6, stall * 0.4, stall * 0.1},
+		Disks: map[string]diskStat{
+			"nvme0n1":  disk(3200*ioLoad/40, 900, 400+ioLoad*20, 1300+ioLoad*80),
+			"sda":      disk(40, 12*ioLoad, 120*ioLoad, 300*ioLoad),
+			"pve-root": disk(2, 30, 6, 9),
+			"pve-data": disk(0, 0, 0, 0), "sdb": disk(0, 0, 0, 0), "sdc": disk(0, 0, 0, 0),
+		}}
+
+	prev := Sample{At: t0, CPU: prevCPU, IO: prevIO}
 	cur := Sample{
 		At: t0.Add(time.Second), Total: total, Available: avail, Free: total / 25,
 		SwapTotal: 8 * gib, SwapUsed: uint64(swapGiB * gib), HasPSI: true, HasSwapIO: true,
@@ -58,7 +76,7 @@ func synth(stall, full float64, realUsed, swapGiB float64, swapInMiB, refaultMiB
 		Full:   PSILine{full, full * 0.6, full * 0.2},
 		SwapIn: uint64(swapInMiB * mib / ps), Refault: uint64(refaultMiB * mib / ps),
 		DirectScan: uint64(refaultMiB * 0.3 * mib / ps), SwapOut: uint64(swapInMiB * 0.5 * mib / ps),
-		CPU: curCPU, Limited: source != "system",
+		CPU: curCPU, IO: curIO, Limited: source != "system",
 	}
 	cur.Droppable = sat(cur.Available, cur.Free)
 	r := assess(testCfg, &prev, cur, source)
@@ -72,6 +90,7 @@ func synth(stall, full float64, realUsed, swapGiB float64, swapInMiB, refaultMiB
 		rr.Rates.SwapIn, rr.Rates.Refault = r.Rates.SwapIn*f, r.Rates.Refault*f
 		rr.Rates.DirectScan, rr.Rates.SwapOut = r.Rates.DirectScan*f, r.Rates.SwapOut*f
 		rr.CPU.Waiting, rr.CPU.Steal, rr.CPU.Throttled = r.CPU.Waiting*f, r.CPU.Steal*f, r.CPU.Throttled*f
+		rr.Sample.IO.Some.Avg10 = stall * 1.4 * f
 		h.push(&rr)
 	}
 	return r, h
@@ -104,7 +123,7 @@ func TestPreview(t *testing.T) {
 						continue
 					}
 					lines := render(r, view{Width: w, Live: live, Compact: compact, Interval: time.Second, Hist: h,
-						MemBands: testCfg.memBands, CPUBands: testCfg.cpuBands, Host: "hearth", Kernel: "6.18.44"})
+						MemBands: testCfg.memBands, CPUBands: testCfg.cpuBands, IOBands: testCfg.ioBands, Host: "hearth", Kernel: "6.18.44"})
 					for i, l := range lines {
 						if got := utf8.RuneCountInString(ansi(l)); got != w {
 							t.Errorf("%s w=%d live=%v compact=%d line %d width %d != %d: %q", c.name, w, live, compact, i, got, w, ansi(l))
@@ -171,5 +190,35 @@ func TestAssessCPU(t *testing.T) {
 	cur = CPUSample{HasTicks: true, Ticks: cpuTicks{total: 1400, idle: 100, iowait: 0, steal: 40}}
 	if r := assessCPU(testCfg, &prev, cur, 1); math.Abs(r.Busy-65) > 0.01 || math.Abs(r.Steal-10) > 0.01 {
 		t.Errorf("busy/steal: %+v", r)
+	}
+}
+
+func TestAssessIO(t *testing.T) {
+	for _, tc := range []struct {
+		some, full float64
+		want       State
+	}{{0, 0, StateOK}, {6, 0, StateStrained}, {25, 0, StatePressured}, {3, 6, StatePressured}, {60, 0, StateThrashing}, {10, 25, StateThrashing}} {
+		s := IOSample{HasPSI: true, Some: PSILine{Avg10: tc.some}, Full: PSILine{Avg10: tc.full}}
+		if got := assessIO(testCfg, nil, s, 0).State; got != tc.want {
+			t.Errorf("io some=%v full=%v: got %v want %v", tc.some, tc.full, got, tc.want)
+		}
+	}
+	// Device maths over a 2 s window: 400 ops, 2000 ms of op time,
+	// 1000 ms busy, 3000 ms·requests in flight.
+	prev := IOSample{HasDisks: true, Disks: map[string]diskStat{"sda": {}, "sdb": {}}}
+	cur := IOSample{HasDisks: true, Disks: map[string]diskStat{
+		"sda": {reads: 300, writes: 100, rsect: 2048, wsect: 1024, rms: 1500, wms: 500, ioms: 1000, weightedMs: 3000},
+		"sdb": {},
+	}}
+	r := assessIO(testCfg, &prev, cur, 2)
+	if len(r.Disks) != 1 || r.Idle != 1 {
+		t.Fatalf("disks=%+v idle=%d", r.Disks, r.Idle)
+	}
+	d := r.Disks[0]
+	if d.IOPS != 200 || d.AwaitMs != 5 || d.Queue != 1.5 || d.Util != 50 || d.ReadBps != 524288 || d.WriteBps != 262144 {
+		t.Errorf("sda: %+v", d)
+	}
+	if !r.Estimated || r.State != StateOK {
+		t.Errorf("no-PSI estimate: %+v", r)
 	}
 }

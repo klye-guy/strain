@@ -1,10 +1,11 @@
-// strain — is Linux actually short of memory or CPU?
+// strain — is Linux actually short of memory, CPU or I/O?
 //
 // "Used" memory and CPU utilization both mislead: Linux fills spare RAM with
 // cache, and a busy CPU is not necessarily an overloaded one. strain reports
-// whether tasks are *waiting* — on memory or for a core — using the kernel's
-// pressure stall information (PSI), backed by MemAvailable, paging rates,
-// run-queue depth, steal time and cgroup throttling.
+// whether tasks are *waiting* — on memory, for a core, or on storage — using
+// the kernel's pressure stall information (PSI), backed by MemAvailable,
+// paging rates, run-queue depth, steal time, cgroup throttling and per-device
+// latency and queue depth.
 package main
 
 import (
@@ -22,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type config struct {
 	interval time.Duration
@@ -32,10 +33,11 @@ type config struct {
 	cgroup   string
 	memBands [3]float64
 	cpuBands [3]float64
+	ioBands  [3]float64
 	color    string
 }
 
-const usage = `strain — is Linux actually short of memory or CPU?
+const usage = `strain — is Linux actually short of memory, CPU or I/O?
 
 Usage:
   strain [flags]
@@ -46,7 +48,7 @@ Modes:
   -j, --json           snapshot as JSON
       --check          one-line, monitoring-plugin style result; exit code
                        0 OK · 1 WARNING · 2 CRITICAL · 3 error
-                       (worse of memory and CPU)
+                       (worst of memory, CPU and I/O)
 
 Options:
   -i, --interval DUR   refresh interval, and the snapshot sampling window
@@ -58,6 +60,9 @@ Options:
                        begin (default 1,10,25; --bands is an alias)
       --cpu-bands A,B,C
                        CPU stall %% where BUSY, CONTENDED, SATURATED begin
+                       (default 5,20,50)
+      --io-bands A,B,C
+                       I/O stall %% where BUSY, CONGESTED, SATURATED begin
                        (default 5,20,50)
       --color WHEN     auto, always or never (default auto; honours NO_COLOR)
   -v, --version
@@ -131,7 +136,7 @@ func run() int {
 			}
 		}
 		lines := render(rep, view{
-			Width: width, MemBands: cfg.memBands, CPUBands: cfg.cpuBands,
+			Width: width, MemBands: cfg.memBands, CPUBands: cfg.cpuBands, IOBands: cfg.ioBands,
 			Interval: cfg.interval, Host: hostName(), Kernel: kernelRelease(),
 		})
 		fmt.Println(strings.Join(lines, "\n"))
@@ -143,7 +148,7 @@ func parseFlags(args []string) (*config, error) {
 	c := &config{}
 	fs := flag.NewFlagSet("strain", flag.ContinueOnError)
 	fs.SetOutput(new(strings.Builder)) // we print our own messages
-	var memBands, cpuBands string
+	var memBands, cpuBands, ioBands string
 	var showVersion bool
 	fs.BoolVar(&c.snapshot, "s", false, "")
 	fs.BoolVar(&c.snapshot, "snapshot", false, "")
@@ -156,6 +161,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&memBands, "bands", "1,10,25", "")
 	fs.StringVar(&memBands, "mem-bands", "1,10,25", "")
 	fs.StringVar(&cpuBands, "cpu-bands", "5,20,50", "")
+	fs.StringVar(&ioBands, "io-bands", "5,20,50", "")
 	fs.StringVar(&c.color, "color", "auto", "")
 	fs.BoolVar(&showVersion, "v", false, "")
 	fs.BoolVar(&showVersion, "version", false, "")
@@ -177,6 +183,9 @@ func parseFlags(args []string) (*config, error) {
 		return c, err
 	}
 	if c.cpuBands, err = parseBands("--cpu-bands", cpuBands); err != nil {
+		return c, err
+	}
+	if c.ioBands, err = parseBands("--io-bands", ioBands); err != nil {
 		return c, err
 	}
 	switch c.color {
@@ -311,7 +320,8 @@ func runLive(cfg *config, src Source) error {
 		w := panelWidth(cols)
 		v := view{
 			Width: w, Live: true, Paused: paused, Interval: interval, Hist: hist,
-			MemBands: cfg.memBands, CPUBands: cfg.cpuBands, Host: host, Kernel: kernel,
+			MemBands: cfg.memBands, CPUBands: cfg.cpuBands, IOBands: cfg.ioBands,
+			Host: host, Kernel: kernel,
 		}
 		// Short terminal: shed history rows, then explanations, then spacer
 		// rows, before letting the bottom of the panel fall off-screen.
@@ -414,14 +424,25 @@ type jsonCPU struct {
 	ThrottledMsS *float64 `json:"throttled_ms_per_s,omitempty"`
 }
 
+type jsonIO struct {
+	State     string       `json:"state"`
+	Estimated bool         `json:"estimated"`
+	Trend     string       `json:"trend,omitempty"`
+	Stall     *jsonStall   `json:"stall"`
+	StallNote string       `json:"stall_note,omitempty"`
+	Devices   []DiskReport `json:"devices"`
+	Idle      int          `json:"idle_devices"`
+}
+
 type jsonReport struct {
 	Time   time.Time  `json:"time"`
 	Host   string     `json:"host"`
 	Kernel string     `json:"kernel"`
 	Source string     `json:"source"`
-	Level  string     `json:"level"` // ok · warning · critical (worse of the two)
+	Level  string     `json:"level"` // ok · warning · critical (worst of the three)
 	Memory jsonMemory `json:"memory"`
 	CPU    jsonCPU    `json:"cpu"`
+	IO     jsonIO     `json:"io"`
 }
 
 var trendNames = [...]string{"easing", "steady", "rising"}
@@ -470,6 +491,20 @@ func toJSON(r *Report) jsonReport {
 	if c.HasWaiting {
 		p.Waiting, p.WaitingNow = ptr(c.Waiting), c.WaitApprox
 	}
+
+	io, q := r.IO, &j.IO
+	q.State, q.Estimated = strings.ToLower(ioStateNames[io.State]), io.Estimated
+	if s.IO.HasPSI {
+		q.Stall, q.Trend = &jsonStall{s.IO.Some, s.IO.Full}, trendNames[io.Trend+1]
+	} else {
+		q.StallNote = s.IO.PSIReason
+	}
+	q.Devices, q.Idle = []DiskReport{}, io.Idle
+	for _, d := range io.Disks {
+		d.IOPS, d.AwaitMs, d.Queue, d.Util = round1(d.IOPS), round1(d.AwaitMs), round1(d.Queue), round1(d.Util)
+		d.ReadBps, d.WriteBps = math.Round(d.ReadBps), math.Round(d.WriteBps)
+		q.Devices = append(q.Devices, d)
+	}
 	return j
 }
 
@@ -490,11 +525,23 @@ func checkLine(r *Report, c *config) string {
 	} else {
 		fmt.Fprintf(&b, " (estimated, busy %.0f%%)", cp.Busy)
 	}
+	fmt.Fprintf(&b, ", io %s", ioStateNames[r.IO.State])
+	if s.IO.HasPSI {
+		fmt.Fprintf(&b, " (stall %.1f%%)", s.IO.Some.Avg10)
+	} else {
+		b.WriteString(" (estimated)")
+	}
 	fmt.Fprintf(&b, " | mem_stall=%.2f%%;%g;%g mem_stall_full=%.2f%% real_used=%.1f%% demand=%.1f%%",
 		s.Some.Avg10, c.memBands[0], c.memBands[1], s.Full.Avg10, r.RealUsed, r.Demand)
 	fmt.Fprintf(&b, " swap_in=%.0fB refault=%.0fB direct_scan=%.0fB",
 		r.Rates.SwapIn, r.Rates.Refault, r.Rates.DirectScan)
 	fmt.Fprintf(&b, " cpu_stall=%.2f%%;%g;%g cpu_busy=%.1f%% cpu_steal=%.1f%% run_queue=%.2f",
 		s.CPU.Some.Avg10, c.cpuBands[0], c.cpuBands[1], cp.Busy, cp.Steal, cp.Waiting)
+	worstAwait := 0.0
+	for _, d := range r.IO.Disks {
+		worstAwait = max(worstAwait, d.AwaitMs)
+	}
+	fmt.Fprintf(&b, " io_stall=%.2f%%;%g;%g io_stall_full=%.2f%% io_await_max=%.1fms",
+		s.IO.Some.Avg10, c.ioBands[0], c.ioBands[1], s.IO.Full.Avg10, worstAwait)
 	return b.String()
 }

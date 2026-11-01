@@ -50,10 +50,11 @@ type Report struct {
 	Rates    Rates
 
 	CPU CPUReport
+	IO  IOReport
 }
 
-// Overall is the worse of the memory and CPU verdicts.
-func (r *Report) Overall() State { return max(r.State, r.CPU.State) }
+// Overall is the worst of the memory, CPU and I/O verdicts.
+func (r *Report) Overall() State { return max(r.State, r.CPU.State, r.IO.State) }
 
 const mib = 1 << 20
 
@@ -70,11 +71,13 @@ func assess(c *config, prev *Sample, cur Sample, source string) *Report {
 	r.HeadroomLow = r.RealUsed >= 90
 
 	var prevCPU *CPUSample
+	var prevIO *IOSample
 	var dt float64
 	if prev != nil {
-		prevCPU, dt = &prev.CPU, cur.At.Sub(prev.At).Seconds()
+		prevCPU, prevIO, dt = &prev.CPU, &prev.IO, cur.At.Sub(prev.At).Seconds()
 	}
 	r.CPU = assessCPU(c, prevCPU, cur.CPU, dt)
+	r.IO = assessIO(c, prevIO, cur.IO, dt)
 
 	if prev != nil {
 		if dt > 0.05 {

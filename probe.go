@@ -47,6 +47,7 @@ type Sample struct {
 	HasSwapIO                            bool
 
 	CPU CPUSample
+	IO  IOSample
 }
 
 // Source produces Samples.
@@ -200,6 +201,7 @@ func (systemSource) Probe() (Sample, error) {
 
 	s.Some, s.Full, s.PSIReason, s.HasPSI = readPSI("/proc/pressure/memory")
 	s.CPU = probeCPUSystem()
+	s.IO = probeIO("/proc/pressure/io")
 	return s, nil
 }
 
@@ -287,6 +289,7 @@ func (c cgroupSource) Probe() (Sample, error) {
 
 	s.Some, s.Full, s.PSIReason, s.HasPSI = readPSI(at("memory.pressure"))
 	s.CPU = probeCPUCgroup(c.dir)
+	s.IO = probeIO(at("io.pressure")) // device rows stay host-wide
 	return s, nil
 }
 

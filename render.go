@@ -384,6 +384,7 @@ type history struct {
 	at                                      []time.Time
 	stall, swapIn, swapOut, refault, direct []float64
 	cpuStall, queue, steal, throttle        []float64
+	ioStall                                 []float64
 }
 
 func (h *history) push(r *Report) {
@@ -401,11 +402,12 @@ func (h *history) push(r *Report) {
 	h.queue = append(h.queue, c.Waiting)
 	h.steal = append(h.steal, c.Steal)
 	h.throttle = append(h.throttle, c.Throttled)
+	h.ioStall = append(h.ioStall, r.Sample.IO.Some.Avg10)
 	if len(h.at) > histCap {
 		cut := len(h.at) - histCap
 		h.at = h.at[cut:]
 		for _, s := range []*[]float64{&h.stall, &h.swapIn, &h.swapOut, &h.refault,
-			&h.direct, &h.cpuStall, &h.queue, &h.steal, &h.throttle} {
+			&h.direct, &h.cpuStall, &h.queue, &h.steal, &h.throttle, &h.ioStall} {
 			*s = (*s)[cut:]
 		}
 	}
@@ -432,6 +434,7 @@ type view struct {
 	Hist     *history
 	MemBands [3]float64
 	CPUBands [3]float64
+	IOBands  [3]float64
 	Kernel   string
 	Host     string
 }
@@ -576,6 +579,21 @@ func render(r *Report, v view) []string {
 	}, v)
 	f.blank()
 
+	io := r.IO
+	ioReason := s.IO.PSIReason
+	ioUnknown := !s.IO.HasPSI && !io.HasRates
+	if ioUnknown {
+		ioReason = "measuring…"
+	}
+	f.pressure(pressureBlock{
+		label: "io", names: ioStateNames, state: io.State, unknown: ioUnknown,
+		hasPSI: s.IO.HasPSI, reason: ioReason, some: s.IO.Some, trend: io.Trend,
+		explain: ioExplain(&io, s.IO.HasPSI), bands: v.IOBands, top: cpuMeterMax,
+		hist:     h.ioStall,
+		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.IO.Full.Avg10)),
+	}, v)
+	f.blank()
+
 	// ── memory capacity
 	capR := newLn().put(cLabel, fmtBytes(float64(s.Total))+" RAM")
 	if r.Source != "system" {
@@ -710,6 +728,15 @@ func render(r *Report, v view) []string {
 	}
 	f.blank()
 
+	// ── disk activity
+	diskR := "per second"
+	if r.Source != "system" {
+		diskR = "host devices"
+	}
+	f.rule("├", "┤", newLn().bold(cAccent, "disk activity"), newLn().put(cLabel, diskR))
+	f.diskTable(&io)
+	f.blank()
+
 	// ── footer
 	if v.Live {
 		keys := newLn().put(cAccent, "q").put(cLabel, " quit  ").
@@ -728,4 +755,105 @@ func render(r *Report, v view) []string {
 		f.rule("╰", "╯", newLn().put(cLabel, win), newLn().put(cLabel, "kernel "+v.Kernel))
 	}
 	return f.out
+}
+
+// ── disk table ────────────────────────────────────────────────────────────
+
+const maxDisks = 4
+
+type diskCol struct {
+	title string
+	w     int
+}
+
+var baseDiskCols = [...]diskCol{{"device", 12}, {"iops", 7}, {"read", 10}, {"write", 10}, {"await", 9}, {"queue", 7}, {"util", 6}}
+
+// diskColumns widens the numeric columns evenly when the panel has room.
+func diskColumns(iw int) [7]diskCol {
+	cols := baseDiskCols
+	used := 0
+	for _, c := range cols {
+		used += c.w
+	}
+	pad := min(max((iw-used)/6, 0), 5)
+	for i := 1; i < len(cols); i++ {
+		cols[i].w += pad
+	}
+	return cols
+}
+
+func fmtIOPS(v float64) string {
+	if v >= 1000 {
+		return fmt.Sprintf("%.1fk", v/1000)
+	}
+	return fmt.Sprintf("%.0f", v)
+}
+
+func fmtMs(v float64) string {
+	if v < 10 {
+		return fmt.Sprintf("%.1f ms", v)
+	}
+	return fmt.Sprintf("%.0f ms", v)
+}
+
+func (f *frame) diskTable(io *IOReport) {
+	if !io.HasRates {
+		f.row(newLn().put(cFaint, "measuring…"))
+		return
+	}
+	if len(io.Disks) == 0 {
+		msg := "no block devices found"
+		if io.Idle > 0 {
+			msg = fmt.Sprintf("all %d devices idle", io.Idle)
+		}
+		f.row(newLn().put(cFaint, msg))
+		return
+	}
+
+	diskCols := diskColumns(f.IW)
+	head := newLn()
+	for i, c := range diskCols {
+		if i == 0 {
+			head.put(cFaint, c.title).to(c.w)
+		} else {
+			head.put(cFaint, rjust(c.title, c.w))
+		}
+	}
+	f.row(head)
+
+	for _, d := range io.Disks[:min(len(io.Disks), maxDisks)] {
+		l := newLn().put(cText, fit(d.Name, diskCols[0].w-1)).to(diskCols[0].w)
+		cell := func(i int, text string, c rgb, bold bool) {
+			if bold {
+				l.bold(c, rjust(text, diskCols[i].w))
+			} else {
+				l.put(c, rjust(text, diskCols[i].w))
+			}
+		}
+		bytesCell := func(i int, b float64) {
+			if b <= 0 {
+				cell(i, "0", cFaint, false)
+			} else {
+				cell(i, fmtBytes(b), cText, false)
+			}
+		}
+		cell(1, fmtIOPS(d.IOPS), cText, false)
+		bytesCell(2, d.ReadBps)
+		bytesCell(3, d.WriteBps)
+		cell(4, fmtMs(d.AwaitMs), level(d.AwaitMs, 10, 50, 200), d.AwaitMs >= 10)
+		cell(5, fmt.Sprintf("%.1f", d.Queue), cText, false)
+		cell(6, fmt.Sprintf("%.0f%%", d.Util), cLabel.scale(0.7), false)
+		f.row(l)
+	}
+
+	var more []string
+	if n := len(io.Disks) - maxDisks; n > 0 {
+		more = append(more, fmt.Sprintf("+%d more active", n))
+	}
+	if io.Idle > 0 {
+		more = append(more, fmt.Sprintf("%d idle", io.Idle))
+	}
+	if len(more) > 0 {
+		f.row(newLn().put(cFaint, strings.Join(more, " · ")))
+	}
 }

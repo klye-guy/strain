@@ -1,12 +1,13 @@
 # strain
 
-Is Linux actually short of memory or CPU?
+Is Linux actually short of memory, CPU or I/O?
 
-Both of the usual numbers mislead. Linux fills spare RAM with page cache, so
+All the usual numbers mislead. Linux fills spare RAM with page cache, so
 `free` and `top` report a high "used" figure on any healthy machine. A CPU at
 100 % utilization may be doing ideal work, while one at 60 % can still have
-tasks queuing. `strain` ignores those baselines and answers the real question:
-**are tasks waiting, on memory or for a core?**
+tasks queuing. A disk at "100 % util" may have most of its capacity left.
+`strain` ignores those baselines and answers the real question:
+**are tasks waiting, on memory, for a core, or on storage?**
 
 Single static binary, Go standard library only, no root required.
 
@@ -31,8 +32,9 @@ sudo install -m 0755 strain /usr/local/bin/
 
 ## How it decides
 
-Both verdicts come from the kernel's **pressure stall information** (PSI,
-kernel 4.20+): `/proc/pressure/memory` and `/proc/pressure/cpu`. Each reports
+All three verdicts come from the kernel's **pressure stall information** (PSI,
+kernel 4.20+): `/proc/pressure/memory`, `/proc/pressure/cpu` and
+`/proc/pressure/io`. Each reports
 the share of wall time tasks spent waiting on that resource, averaged over
 10 s, 60 s and 300 s. The headline is `some avg10`: the percentage of the last
 10 seconds in which at least one task was stalled.
@@ -120,6 +122,43 @@ instantaneous `procs_running` count minus online cores, labelled *now*
 instead of *avg*. Without CPU PSI, the CPU verdict is estimated from run-queue
 depth per core (0.05 / 0.25 / 1).
 
+## I/O
+
+### Verdict
+
+`some` is the % of time at least one task was stalled waiting on storage.
+Unlike CPU, `full` is meaningful system-wide: the % of time *every* non-idle
+task was stalled on I/O at once.
+
+Bands (`--io-bands A,B,C`):
+
+| State | `some avg10` | or `full avg10` |
+|---|---|---|
+| OK | < 5 % | |
+| BUSY | 5 – 20 % | |
+| CONGESTED | 20 – 50 % | ≥ 5 % |
+| SATURATED | ≥ 50 % | ≥ 20 % |
+
+### Disk activity (per-second deltas from `/proc/diskstats`)
+
+One row per active whole device, busiest first by queue depth, up to four.
+Partitions, loop, ram, zram, floppy and optical devices are skipped.
+Device-mapper volumes show their dm name (`pve-root` rather than `dm-0`).
+
+| Column | Derivation | Meaning |
+|---|---|---|
+| iops | completed reads + writes | Requests per second |
+| read, write | sectors × 512 | Throughput |
+| await | (read ms + write ms) / requests | Average latency per request, queueing included. The number users feel |
+| queue | weighted ms / elapsed ms | Average requests in flight (iostat's `aqu-sz`) |
+| util | ms with any I/O in flight / elapsed ms | Shown dimmed, for contrast. It was meaningful for a single spinning disk; NVMe, RAID and virtual disks serve many requests in parallel, so 100 % says nothing about remaining capacity |
+
+Await turns amber at 10 ms, orange at 50 ms and red at 200 ms. Those are loose
+on purpose, to flag real trouble on anything from NVMe to spinning disks.
+
+**Without PSI**, the I/O verdict is estimated from the worst device await
+(20 / 100 / 500 ms).
+
 ## cgroup mode (`--cgroup PATH`, v2 only)
 
 PATH is absolute or relative to `/sys/fs/cgroup`.
@@ -132,6 +171,8 @@ PATH is absolute or relative to `/sys/fs/cgroup`.
   the `cpu.max` quota when one is set (shown as e.g. "quota 1.5 cores"),
   otherwise against all host cores. Run-queue depth has no per-cgroup source,
   so it shows n/a; steal is the host's.
+- **I/O** verdict comes from `io.pressure`. The disk table stays host-wide
+  (labelled "host devices"), since per-device latency has no cgroup source.
 
 ## Live keys
 
@@ -139,21 +180,22 @@ PATH is absolute or relative to `/sys/fs/cgroup`.
 
 ## Machine-readable output
 
-`-j` prints one JSON object with `memory` and `cpu` sections, each carrying
-its own `state`, `stall` figures and supporting metrics. The top-level `level`
-is `ok`, `warning` or `critical`: the worse of the two.
+`-j` prints one JSON object with `memory`, `cpu` and `io` sections, each
+carrying its own `state`, `stall` figures and supporting metrics (`io` lists
+every active device). The top-level `level` is `ok`, `warning` or `critical`:
+the worst of the three.
 
 `--check` prints one line with perfdata after the `|`:
 
 ```
-CRITICAL - memory OK (stall 0.0%, real used 6%), cpu SATURATED (stall 65.3%, busy 99%) | mem_stall=0.00%;1;10 …
+CRITICAL - memory OK (stall 0.0%, real used 6%), cpu BUSY (stall 6.7%, busy 28%), io SATURATED (stall 49.7%) | mem_stall=0.00%;1;10 …
 ```
 
 ## Exit codes
 
 | Mode | Code |
 |---|---|
-| `--check` | 0 OK · 1 WARNING (STRAINED / BUSY) · 2 CRITICAL (anything worse) · 3 error |
+| `--check` | 0 OK · 1 WARNING (STRAINED / BUSY) · 2 CRITICAL (anything worse) · 3 error, judged on the worst of the three |
 | Everything else | 0 success · 1 runtime error · 2 bad flags |
 
 ## Trying it under real pressure
@@ -165,6 +207,9 @@ systemd-run --user --scope -p MemoryMax=256M -p MemorySwapMax=1G \
 
 # cpu: twice as many busy workers as cores
 stress-ng --cpu $(( $(nproc) * 2 )) --timeout 60s
+
+# io: parallel synchronous direct writes
+stress-ng --hdd 4 --hdd-opts direct,dsync --timeout 60s
 
 # then, in another terminal
 strain
