@@ -1,11 +1,12 @@
 # strain
 
-How hard is Linux actually working to find memory?
+Is Linux actually short of memory or CPU?
 
-Linux fills spare RAM with page cache, so `free` and `top` report a high
-"used" figure on any healthy machine. `strain` ignores that baseline and answers
-the real question: **are tasks waiting on memory, and is the working set bigger
-than RAM?**
+Both of the usual numbers mislead. Linux fills spare RAM with page cache, so
+`free` and `top` report a high "used" figure on any healthy machine. A CPU at
+100 % utilization may be doing ideal work, while one at 60 % can still have
+tasks queuing. `strain` ignores those baselines and answers the real question:
+**are tasks waiting, on memory or for a core?**
 
 Single static binary, Go standard library only, no root required.
 
@@ -18,7 +19,8 @@ strain --cgroup system.slice/postgresql.service
 ```
 
 Piping the output (`strain | tee …`) automatically prints a snapshot instead
-of the live view.
+of the live view. In a short terminal the live view sheds its history rows,
+then its explanations, then its spacing, so the whole panel still fits.
 
 ## Build
 
@@ -27,19 +29,28 @@ CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o strain .
 sudo install -m 0755 strain /usr/local/bin/
 ```
 
-## What it shows
+## How it decides
 
-### Verdict: memory stall % (the headline)
+Both verdicts come from the kernel's **pressure stall information** (PSI,
+kernel 4.20+): `/proc/pressure/memory` and `/proc/pressure/cpu`. Each reports
+the share of wall time tasks spent waiting on that resource, averaged over
+10 s, 60 s and 300 s. The headline is `some avg10`: the percentage of the last
+10 seconds in which at least one task was stalled.
 
-Read from `/proc/pressure/memory` (PSI, kernel 4.20+).
+The trend arrow compares the 10 s average against the 60 s average. Stall
+meters use a square-root scale, so the low bands that matter most get real
+width instead of a sliver at the left edge.
+
+## Memory
+
+### Verdict
 
 | Field | Meaning |
 |---|---|
-| `some` | % of wall time at least one task was stalled waiting on memory: reclaim, swap-in, or re-reading evicted pages |
+| `some` | % of time at least one task was stalled on memory: reclaim, swap-in, or re-reading evicted pages |
 | `full` | % of time *every* runnable task was stalled at once, so no useful work happened |
 
-The headline is `some avg10`. The verdict uses these bands (`--bands A,B,C`
-changes them):
+Bands (`--mem-bands A,B,C`; `--bands` is an alias):
 
 | State | `some avg10` | or `full avg10` |
 |---|---|---|
@@ -47,11 +58,6 @@ changes them):
 | STRAINED | 1 – 10 % | |
 | PRESSURED | 10 – 25 % | ≥ 2 % |
 | THRASHING | ≥ 25 % | ≥ 10 % |
-
-The trend arrow compares the 10 s average against the 60 s average.
-
-The stall meter uses a square-root scale over 0–50 %, so the 1 % and 10 %
-bands get real width instead of a sliver at the left edge.
 
 ### Capacity
 
@@ -64,6 +70,10 @@ bands get real width instead of a sliver at the left edge.
 
 High real usage with 0 % stall is fine. It means RAM is well used, not short.
 
+`MemAvailable` is an estimate. It treats all page cache as droppable, even
+cache a workload depends on, and it counts ZFS ARC as used. Trust the stall
+figure when the two disagree.
+
 ### Paging activity (per-second deltas from `/proc/vmstat`)
 
 | Row | Counter | Meaning |
@@ -73,36 +83,89 @@ High real usage with 0 % stall is fine. It means RAM is well used, not short.
 | direct reclaim | `pgscan_direct` | Allocations forced to reclaim memory themselves because kswapd couldn't keep up |
 | swap-out | `pswpout` | Idle pages being parked; usually harmless on its own |
 
-These explain *why* the stall figure is elevated.
+**Without PSI**, the memory verdict is estimated from swap-in + refault
+throughput (1 / 16 / 64 MiB/s) and direct reclaim, and is labelled
+*estimated*.
 
-**Without PSI** (kernel built without it, or RHEL-family kernels booted
-without `psi=1`), the verdict is estimated from swap-in + refault throughput
-(1 / 16 / 64 MiB/s) and direct reclaim, and is labelled *estimated*.
+## CPU
 
-### cgroup mode (`--cgroup PATH`, v2 only)
+### Verdict
 
-PATH is absolute or relative to `/sys/fs/cgroup`. The figures come from
-`memory.pressure`, `memory.current`, `memory.max`, `memory.stat` and
-`memory.swap.*`. The working set is `memory.current − inactive_file`, the same
-convention the kubelet uses. A group with no limit is sized against host RAM.
+`some` is the % of time at least one runnable task was queued for a core
+instead of running. System-wide `full` is always 0, since something is always
+running when others wait. It is only meaningful for a cgroup, where it means
+the whole group was starved.
+
+Brief queuing is normal scheduling, so the CPU bands sit higher than the
+memory ones (`--cpu-bands A,B,C`):
+
+| State | `some avg10` |
+|---|---|
+| OK | < 5 % |
+| BUSY | 5 – 20 % |
+| CONTENDED | 20 – 50 % |
+| SATURATED | ≥ 50 % |
+
+### CPU activity
+
+| Row | Source | Meaning |
+|---|---|---|
+| busy | `/proc/stat` jiffies, excluding idle, iowait and steal | Utilization, shown for contrast. 100 % busy with no waiting is healthy |
+| run queue | `/proc/schedstat` run_delay, per-second delta | Average number of tasks waiting for a core. Stall % says *how often* tasks waited; this says *how many* |
+| steal | `/proc/stat` steal | On a VM: time the hypervisor gave your vCPUs to other guests. PSI can't see it, so high steal with low stall means the *host* is oversubscribed |
+| throttled | cgroup `cpu.stat` throttled_usec | cgroup mode only: time held back by the `cpu.max` quota while cores sat free |
+
+If `/proc/schedstat` is missing, the run queue falls back to the
+instantaneous `procs_running` count minus online cores, labelled *now*
+instead of *avg*. Without CPU PSI, the CPU verdict is estimated from run-queue
+depth per core (0.05 / 0.25 / 1).
+
+## cgroup mode (`--cgroup PATH`, v2 only)
+
+PATH is absolute or relative to `/sys/fs/cgroup`.
+
+- **Memory** comes from `memory.pressure`, `memory.current`, `memory.max`,
+  `memory.stat` and `memory.swap.*`. The working set is
+  `memory.current − inactive_file`, the same convention the kubelet uses. A
+  group with no limit is sized against host RAM.
+- **CPU** comes from `cpu.pressure` and `cpu.stat`. Busy % is measured against
+  the `cpu.max` quota when one is set (shown as e.g. "quota 1.5 cores"),
+  otherwise against all host cores. Run-queue depth has no per-cgroup source,
+  so it shows n/a; steal is the host's.
 
 ## Live keys
 
 `q` quit · `p` / space pause · `+` / `-` slower / faster refresh · `r` repaint
 
+## Machine-readable output
+
+`-j` prints one JSON object with `memory` and `cpu` sections, each carrying
+its own `state`, `stall` figures and supporting metrics. The top-level `level`
+is `ok`, `warning` or `critical`: the worse of the two.
+
+`--check` prints one line with perfdata after the `|`:
+
+```
+CRITICAL - memory OK (stall 0.0%, real used 6%), cpu SATURATED (stall 65.3%, busy 99%) | mem_stall=0.00%;1;10 …
+```
+
 ## Exit codes
 
 | Mode | Code |
 |---|---|
-| `--check` | 0 OK · 1 STRAINED · 2 PRESSURED or THRASHING · 3 error |
-| `--check` output | Includes monitoring-plugin perfdata after the `\|` |
+| `--check` | 0 OK · 1 WARNING (STRAINED / BUSY) · 2 CRITICAL (anything worse) · 3 error |
 | Everything else | 0 success · 1 runtime error · 2 bad flags |
 
 ## Trying it under real pressure
 
 ```
-# a 256 MiB box for a hungry process, watched from another terminal
+# memory: a 256 MiB box for a hungry process
 systemd-run --user --scope -p MemoryMax=256M -p MemorySwapMax=1G \
     stress-ng --vm 1 --vm-bytes 600M --vm-keep
+
+# cpu: twice as many busy workers as cores
+stress-ng --cpu $(( $(nproc) * 2 )) --timeout 60s
+
+# then, in another terminal
 strain
 ```

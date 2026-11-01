@@ -154,6 +154,7 @@ const padX = 2
 
 type frame struct {
 	W, IW int
+	tight bool // drop spacer rows (very short terminals)
 	out   []string
 }
 
@@ -186,7 +187,11 @@ func (f *frame) row(c *ln) {
 	f.out = append(f.out, l.String())
 }
 
-func (f *frame) blank() { f.row(newLn()) }
+func (f *frame) blank() {
+	if !f.tight {
+		f.row(newLn())
+	}
+}
 
 // ── glyph helpers ─────────────────────────────────────────────────────────
 
@@ -195,21 +200,24 @@ var (
 	sparks  = []rune("▁▂▃▄▅▆▇█")
 )
 
-// The stall meter uses a square-root scale over 0–50 % so that the bands
-// that matter most (1 %, 10 %) get real estate instead of a sliver.
-const meterMax = 50.0
+// Stall meters use a square-root scale so the bands that matter most get
+// real width instead of a sliver: memory spans 0–50 %, CPU 0–100 %.
+const (
+	memMeterMax = 50.0
+	cpuMeterMax = 100.0
+)
 
-func meterPos(v float64) float64 {
-	return math.Sqrt(math.Min(math.Max(v, 0), meterMax) / meterMax)
+func meterPos(v, top float64) float64 {
+	return math.Sqrt(clamp(v, 0, top) / top)
 }
 
-func meter(v float64, w int, b [3]float64) *ln {
+func meter(v float64, w int, b [3]float64, top float64) *ln {
 	l := newLn()
-	fill := meterPos(v) * float64(w)
+	fill := meterPos(v, top) * float64(w)
 	full := int(fill)
 	part := int((fill - float64(full)) * 8)
 	for i := 0; i < w; i++ {
-		cellV := math.Pow((float64(i)+0.5)/float64(w), 2) * meterMax
+		cellV := math.Pow((float64(i)+0.5)/float64(w), 2) * top
 		zc := stateColor[zoneOf(cellV, b)]
 		switch {
 		case i < full:
@@ -223,11 +231,11 @@ func meter(v float64, w int, b [3]float64) *ln {
 	return l
 }
 
-func meterTicks(w int, b [3]float64) *ln {
+func meterTicks(w int, b [3]float64, top float64) *ln {
 	cells := []rune(strings.Repeat(" ", w))
 	place := func(v float64, label string) {
 		r := []rune(label)
-		start := int(math.Round(meterPos(v) * float64(w)))
+		start := int(math.Round(meterPos(v, top) * float64(w)))
 		if start+len(r) > w {
 			start = w - len(r)
 		}
@@ -241,13 +249,13 @@ func meterTicks(w int, b [3]float64) *ln {
 	for _, v := range b {
 		place(v, fmt.Sprintf("%g", v))
 	}
-	place(meterMax, fmt.Sprintf("%g%%", meterMax))
+	place(top, fmt.Sprintf("%g%%", top))
 	return newLn().put(cFaint, string(cells))
 }
 
 func bar(p float64, w int, c rgb) *ln {
 	l := newLn()
-	fill := math.Min(math.Max(p, 0), 100) / 100 * float64(w)
+	fill := clamp(p, 0, 100) / 100 * float64(w)
 	full := int(fill)
 	part := int((fill - float64(full)) * 8)
 	for i := 0; i < w; i++ {
@@ -263,7 +271,7 @@ func bar(p float64, w int, c rgb) *ln {
 	return l
 }
 
-func stallSpark(vals []float64, w int, b [3]float64) *ln {
+func stallSpark(vals []float64, w int, b [3]float64, top float64) *ln {
 	vals = tail(vals, w)
 	l := newLn().sp(w - len(vals))
 	for _, v := range vals {
@@ -271,15 +279,20 @@ func stallSpark(vals []float64, w int, b [3]float64) *ln {
 			l.put(cFaint, "▁")
 			continue
 		}
-		i := min(int(meterPos(v)*8), 7)
+		i := min(int(meterPos(v, top)*8), 7)
 		l.put(stateColor[zoneOf(v, b)], string(sparks[i]))
 	}
 	return l
 }
 
-func rateSpark(vals []float64, w int, hot bool) *ln {
+// spark draws a series scaled to its own peak (never below floor), so a
+// quiet system shows a flat baseline rather than amplified noise.
+func spark(vals []float64, w int, floor float64, color func(float64) rgb) *ln {
+	if w <= 0 {
+		return nil
+	}
 	vals = tail(vals, w)
-	peak := float64(mib)
+	peak := floor
 	for _, v := range vals {
 		peak = math.Max(peak, v)
 	}
@@ -289,8 +302,7 @@ func rateSpark(vals []float64, w int, hot bool) *ln {
 			l.put(cFaint, "▁")
 			continue
 		}
-		i := min(int(v/peak*8), 7)
-		l.put(rateColor(v, hot), string(sparks[i]))
+		l.put(color(v), string(sparks[min(int(v/peak*8), 7)]))
 	}
 	return l
 }
@@ -307,18 +319,26 @@ func usageColor(p float64) rgb {
 	return stateColor[StateOK]
 }
 
-func rateColor(bps float64, hot bool) rgb {
+// level picks a colour from three ascending thresholds.
+func level(v, a, b, c float64) rgb {
 	switch {
-	case bps <= 0:
+	case v <= 0:
 		return cLabel
-	case !hot || bps < 1*mib:
+	case v < a:
 		return cText
-	case bps < 16*mib:
+	case v < b:
 		return stateColor[StateStrained]
-	case bps < 64*mib:
+	case v < c:
 		return stateColor[StatePressured]
 	}
 	return stateColor[StateThrashing]
+}
+
+func rateColor(bps float64, hot bool) rgb {
+	if !hot && bps > 0 {
+		return cText
+	}
+	return level(bps, 1*mib, 16*mib, 64*mib)
 }
 
 func fmtBytes(b float64) string {
@@ -338,6 +358,16 @@ func fmtBytes(b float64) string {
 	return fmt.Sprintf("%.0f B", b)
 }
 
+func fmtCores(c float64) string {
+	if c == math.Trunc(c) {
+		if c == 1 {
+			return "1 core"
+		}
+		return fmt.Sprintf("%.0f cores", c)
+	}
+	return fmt.Sprintf("%.2g cores", c)
+}
+
 func fmtSpan(d time.Duration) string {
 	d = d.Round(time.Second)
 	if d < time.Minute {
@@ -353,23 +383,31 @@ const histCap = 400
 type history struct {
 	at                                      []time.Time
 	stall, swapIn, swapOut, refault, direct []float64
+	cpuStall, queue, steal, throttle        []float64
 }
 
 func (h *history) push(r *Report) {
 	if !r.HasRates {
 		return
 	}
+	c := r.CPU
 	h.at = append(h.at, r.At)
 	h.stall = append(h.stall, r.Sample.Some.Avg10)
 	h.swapIn = append(h.swapIn, r.Rates.SwapIn)
 	h.swapOut = append(h.swapOut, r.Rates.SwapOut)
 	h.refault = append(h.refault, r.Rates.Refault)
 	h.direct = append(h.direct, r.Rates.DirectScan)
-	if n := len(h.at); n > histCap {
-		cut := n - histCap
+	h.cpuStall = append(h.cpuStall, r.Sample.CPU.Some.Avg10)
+	h.queue = append(h.queue, c.Waiting)
+	h.steal = append(h.steal, c.Steal)
+	h.throttle = append(h.throttle, c.Throttled)
+	if len(h.at) > histCap {
+		cut := len(h.at) - histCap
 		h.at = h.at[cut:]
-		h.stall, h.swapIn, h.swapOut = h.stall[cut:], h.swapIn[cut:], h.swapOut[cut:]
-		h.refault, h.direct = h.refault[cut:], h.direct[cut:]
+		for _, s := range []*[]float64{&h.stall, &h.swapIn, &h.swapOut, &h.refault,
+			&h.direct, &h.cpuStall, &h.queue, &h.steal, &h.throttle} {
+			*s = (*s)[cut:]
+		}
 	}
 }
 
@@ -389,45 +427,59 @@ type view struct {
 	Width    int
 	Live     bool
 	Paused   bool
+	Compact  int // 0 full · 1 drop history · 2 drop explanations · 3 drop spacers
 	Interval time.Duration
 	Hist     *history
-	Bands    [3]float64
+	MemBands [3]float64
+	CPUBands [3]float64
 	Kernel   string
 	Host     string
 }
 
-func render(r *Report, v view) []string {
-	f := newFrame(v.Width)
+// pressureBlock is one resource's verdict, stall meter and history.
+type pressureBlock struct {
+	label    string
+	names    [4]string
+	state    State
+	unknown  bool // no verdict possible yet
+	hasPSI   bool
+	reason   string
+	some     PSILine
+	trend    int
+	explain  string
+	bands    [3]float64
+	top      float64
+	hist     []float64
+	figExtra *ln
+}
+
+const labelW = 9
+
+func (f *frame) pressure(b pressureBlock, v view) {
 	iw := f.IW
-	s := r.Sample
-	sc := stateColor[r.State]
+	sc := stateColor[b.state]
 
-	// ── header
-	title := newLn().bold(cAccent, "strain").put(cLabel, " · memory pressure")
-	right := newLn().put(cLabel, v.Host+" · "+r.Source+" · "+r.At.Format("15:04:05"))
-	if title.w+right.w+8 > f.W {
-		right = newLn().put(cLabel, r.At.Format("15:04:05"))
-	}
-	f.rule("╭", "╮", title, right)
-	f.blank()
-
-	// ── verdict
-	head := newLn().put(sc, "● ").bold(sc, r.State.String()).to(14)
-	if s.HasPSI {
-		suffix := " of the last 10 s stalled on memory"
-		if iw < 80 {
-			suffix = " stalled on memory"
-		}
-		head.bold(cText, fmt.Sprintf("%.1f%%", s.Some.Avg10)).put(cLabel, suffix)
+	head := newLn().bold(cAccent, b.label).to(labelW)
+	if b.unknown {
+		head.put(cFaint, "○ ").put(cLabel, fit(b.reason, iw-head.w-2))
 	} else {
-		head.put(cLabel, fit("estimated · "+s.PSIReason, iw-head.w))
+		head.put(sc, "● ").bold(sc, b.names[b.state]).to(labelW + 13)
+		if b.hasPSI {
+			suffix := " of the last 10 s stalled"
+			if iw < 80 {
+				suffix = " stalled"
+			}
+			head.bold(cText, fmt.Sprintf("%.1f%%", b.some.Avg10)).put(cLabel, suffix)
+		} else {
+			head.put(cLabel, fit("estimated · "+b.reason, iw-head.w))
+		}
 	}
 	var trend *ln
 	switch {
-	case !s.HasPSI:
-	case r.Trend > 0:
+	case !b.hasPSI:
+	case b.trend > 0:
 		trend = newLn().put(stateColor[StatePressured], "▲ rising")
-	case r.Trend < 0:
+	case b.trend < 0:
 		trend = newLn().put(stateColor[StateOK], "▼ easing")
 	default:
 		trend = newLn().put(cFaint, "━ steady")
@@ -436,42 +488,95 @@ func render(r *Report, v view) []string {
 		head.to(iw - trend.w).cat(trend)
 	}
 	f.row(head)
-	f.row(newLn().sp(2).put(cLabel, fit(explain(r), iw-2)))
-	f.blank()
-
-	// ── stall meter
-	const lw = 9
-	mw := iw - lw
-	if s.HasPSI {
-		f.row(newLn().put(cLabel, "stall").to(lw).cat(meter(s.Some.Avg10, mw, v.Bands)))
-		f.row(newLn().to(lw).cat(meterTicks(mw, v.Bands)))
-		fig := newLn().to(lw).
-			put(cLabel, "some ").bold(cText, fmt.Sprintf("%.2f%%", s.Some.Avg10)).sp(3).
-			put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.Full.Avg10))
-		avgs := newLn().put(cLabel, "1m ").put(cText, fmt.Sprintf("%.2f%%", s.Some.Avg60)).sp(3).
-			put(cLabel, "5m ").put(cText, fmt.Sprintf("%.2f%%", s.Some.Avg300))
-		if fig.w+avgs.w+3 <= iw {
-			fig.to(iw - avgs.w).cat(avgs)
-		}
-		f.row(fig)
-
-		if v.Live && v.Hist != nil {
-			f.blank()
-			f.row(newLn().put(cLabel, "history").to(lw).cat(stallSpark(v.Hist.stall, mw, v.Bands)))
-			caption := newLn().to(lw)
-			if n := min(len(v.Hist.at), mw); n >= 14 {
-				span := v.Hist.at[len(v.Hist.at)-1].Sub(v.Hist.at[len(v.Hist.at)-n])
-				caption.to(lw+mw-n).put(cFaint, "◂ "+fmtSpan(span))
-			}
-			if caption.w <= iw-4 {
-				caption.to(iw-3).put(cFaint, "now")
-			}
-			f.row(caption)
-		}
+	if v.Compact < 2 {
+		f.row(newLn().to(labelW).put(cLabel, fit(b.explain, iw-labelW)))
+	}
+	if !b.hasPSI {
+		return
+	}
+	if v.Compact < 2 {
 		f.blank()
 	}
+	mw := iw - labelW
+	f.row(newLn().put(cLabel, "stall").to(labelW).cat(meter(b.some.Avg10, mw, b.bands, b.top)))
+	f.row(newLn().to(labelW).cat(meterTicks(mw, b.bands, b.top)))
 
-	// ── capacity
+	fig := newLn().to(labelW).put(cLabel, "some ").bold(cText, fmt.Sprintf("%.2f%%", b.some.Avg10))
+	if b.figExtra != nil {
+		fig.sp(3).cat(b.figExtra)
+	}
+	avgs := newLn().put(cLabel, "1m ").put(cText, fmt.Sprintf("%.2f%%", b.some.Avg60)).sp(3).
+		put(cLabel, "5m ").put(cText, fmt.Sprintf("%.2f%%", b.some.Avg300))
+	if fig.w+avgs.w+3 <= iw {
+		fig.to(iw - avgs.w).cat(avgs)
+	}
+	f.row(fig)
+
+	if v.Live && v.Hist != nil && v.Compact < 1 {
+		f.row(newLn().put(cLabel, "history").to(labelW).cat(stallSpark(b.hist, mw, b.bands, b.top)))
+		caption := newLn().to(labelW)
+		if n := min(len(v.Hist.at), mw); n >= 14 {
+			span := v.Hist.at[len(v.Hist.at)-1].Sub(v.Hist.at[len(v.Hist.at)-n])
+			caption.to(labelW+mw-n).put(cFaint, "◂ "+fmtSpan(span))
+		}
+		if caption.w <= iw-4 {
+			caption.to(iw-3).put(cFaint, "now")
+		}
+		f.row(caption)
+	}
+}
+
+func render(r *Report, v view) []string {
+	f := newFrame(v.Width)
+	f.tight = v.Compact >= 3
+	iw := f.IW
+	s, c := r.Sample, r.CPU
+	h := v.Hist
+	if h == nil {
+		h = &history{}
+	}
+
+	// ── header
+	title := newLn().bold(cAccent, "strain").put(cLabel, " · system pressure")
+	right := newLn().put(cLabel, v.Host+" · "+r.Source+" · "+r.At.Format("15:04:05"))
+	if title.w+right.w+8 > f.W {
+		right = newLn().put(cLabel, r.At.Format("15:04:05"))
+	}
+	f.rule("╭", "╮", title, right)
+	f.blank()
+
+	// ── verdicts
+	f.pressure(pressureBlock{
+		label: "memory", names: [4]string{"OK", "STRAINED", "PRESSURED", "THRASHING"},
+		state: r.State, unknown: r.Estimated && !r.HasRates && !s.HasPSI,
+		hasPSI: s.HasPSI, reason: s.PSIReason, some: s.Some, trend: r.Trend,
+		explain: explain(r), bands: v.MemBands, top: memMeterMax, hist: h.stall,
+		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.Full.Avg10)),
+	}, v)
+	f.blank()
+
+	var waitFig *ln
+	if c.HasWaiting {
+		unit := "avg"
+		if c.WaitApprox {
+			unit = "now"
+		}
+		waitFig = newLn().put(cLabel, "waiting ").bold(cText, fmt.Sprintf("%.1f", c.Waiting)).put(cLabel, " "+unit)
+	}
+	cpuUnknown := !s.CPU.HasPSI && !c.HasWaiting
+	cpuReason := s.CPU.PSIReason
+	if cpuUnknown && !c.HasRates {
+		cpuReason = "measuring…"
+	}
+	f.pressure(pressureBlock{
+		label: "cpu", names: cpuStateNames, state: c.State, unknown: cpuUnknown,
+		hasPSI: s.CPU.HasPSI, reason: cpuReason, some: s.CPU.Some, trend: c.Trend,
+		explain: cpuExplain(&c, s.CPU.HasPSI), bands: v.CPUBands, top: cpuMeterMax,
+		hist: h.cpuStall, figExtra: waitFig,
+	}, v)
+	f.blank()
+
+	// ── memory capacity
 	capR := newLn().put(cLabel, fmtBytes(float64(s.Total))+" RAM")
 	if r.Source != "system" {
 		if s.Limited {
@@ -480,16 +585,15 @@ func render(r *Report, v view) []string {
 			capR = newLn().put(cLabel, "no limit · vs host RAM")
 		}
 	}
-	f.rule("├", "┤", newLn().bold(cAccent, "capacity"), capR)
-	f.blank()
+	f.rule("├", "┤", newLn().bold(cAccent, "memory capacity"), capR)
 	const lw2 = 13
 	bw := min(max(iw-lw2-9-30, 12), 44)
 	noteW := iw - lw2 - bw - 9
-	capRow := func(label string, p float64, c rgb, note string, strong bool) {
-		l := newLn().put(cLabel, label).to(lw2).cat(bar(p, bw, c)).sp(2)
+	capRow := func(label string, p float64, col rgb, note string, strong bool) {
+		l := newLn().put(cLabel, label).to(lw2).cat(bar(p, bw, col)).sp(2)
 		pct := rjust(fmt.Sprintf("%.0f%%", p), 5)
 		if strong {
-			l.bold(c, pct)
+			l.bold(col, pct)
 		} else {
 			l.put(cLabel, pct)
 		}
@@ -517,9 +621,7 @@ func render(r *Report, v view) []string {
 	}
 	f.blank()
 
-	// ── paging activity
-	f.rule("├", "┤", newLn().bold(cAccent, "paging activity"), newLn().put(cLabel, "per second"))
-	f.blank()
+	// ── activity rows (shared layout for paging and cpu)
 	const lw3, vw = 16, 11
 	sw := 0
 	if v.Live {
@@ -529,26 +631,17 @@ func render(r *Report, v view) []string {
 	if sw > 0 {
 		noteW3 -= sw + 2
 	}
-	var hs struct{ in, out, ref, dir []float64 }
-	if v.Hist != nil {
-		hs.in, hs.out, hs.ref, hs.dir = v.Hist.swapIn, v.Hist.swapOut, v.Hist.refault, v.Hist.direct
-	}
-	act := func(label string, bps float64, series []float64, note string, hot, avail bool) {
+	actRow := func(label, val string, vc rgb, strong bool, sp *ln, note string) {
 		l := newLn().put(cLabel, label).to(lw3)
-		switch {
-		case !avail:
-			l.put(cFaint, rjust("n/a", vw))
-		case !r.HasRates:
-			l.put(cFaint, rjust("measuring", vw))
-		case bps <= 0:
-			l.put(cFaint, rjust("0", vw))
-		default:
-			l.bold(rateColor(bps, hot), rjust(fmtBytes(bps), vw))
+		if strong {
+			l.bold(vc, rjust(val, vw))
+		} else {
+			l.put(vc, rjust(val, vw))
 		}
 		l.sp(2)
 		if sw > 0 {
-			if avail {
-				l.cat(rateSpark(series, sw, hot))
+			if sp != nil {
+				l.cat(sp)
 			} else {
 				l.sp(sw)
 			}
@@ -557,10 +650,64 @@ func render(r *Report, v view) []string {
 		l.put(cFaint, fit(note, noteW3))
 		f.row(l)
 	}
-	act("swap-in", r.Rates.SwapIn, hs.in, "swapped data wanted back", true, s.HasSwapIO)
-	act("refaults", r.Rates.Refault, hs.ref, "evicted pages needed again", true, true)
-	act("direct reclaim", r.Rates.DirectScan, hs.dir, "stalled allocations", true, true)
-	act("swap-out", r.Rates.SwapOut, hs.out, "idle pages, usually benign", false, s.HasSwapIO)
+	// metric renders one activity row, handling the n/a and warm-up cases.
+	metric := func(label string, avail bool, v float64, text string, col func(float64) rgb,
+		series []float64, floor float64, note string) {
+		switch {
+		case !avail:
+			actRow(label, "n/a", cFaint, false, nil, note)
+		case !r.HasRates:
+			actRow(label, "measuring", cFaint, false, nil, note)
+		case v <= 0:
+			actRow(label, "0", cFaint, false, spark(series, sw, floor, col), note)
+		default:
+			actRow(label, text, col(v), true, spark(series, sw, floor, col), note)
+		}
+	}
+
+	f.rule("├", "┤", newLn().bold(cAccent, "paging activity"), newLn().put(cLabel, "per second"))
+	hot := func(v float64) rgb { return rateColor(v, true) }
+	cold := func(v float64) rgb { return rateColor(v, false) }
+	metric("swap-in", s.HasSwapIO, r.Rates.SwapIn, fmtBytes(r.Rates.SwapIn), hot, h.swapIn, mib, "swapped data wanted back")
+	metric("refaults", true, r.Rates.Refault, fmtBytes(r.Rates.Refault), hot, h.refault, mib, "evicted pages needed again")
+	metric("direct reclaim", true, r.Rates.DirectScan, fmtBytes(r.Rates.DirectScan), hot, h.direct, mib, "stalled allocations")
+	metric("swap-out", s.HasSwapIO, r.Rates.SwapOut, fmtBytes(r.Rates.SwapOut), cold, h.swapOut, mib, "idle pages, usually benign")
+	f.blank()
+
+	// ── cpu activity
+	coreLabel := fmtCores(c.Cores)
+	if s.CPU.Quota {
+		coreLabel = "quota " + coreLabel
+	}
+	f.rule("├", "┤", newLn().bold(cAccent, "cpu activity"), newLn().put(cLabel, coreLabel))
+	busyNote := "what top calls CPU usage"
+	if !c.HasRates {
+		busyNote = "measuring…"
+	}
+	capRow("busy", c.Busy, cLabel.scale(0.7), busyNote, false)
+	cores := max(c.Cores, 1)
+	qNote := "waiting for a core (avg)"
+	if c.WaitApprox {
+		qNote = "waiting right now"
+	}
+	queueCol := func(v float64) rgb { return level(v/cores, 0.05, 0.25, 1) }
+	if c.WaitApprox { // instantaneous: don't wait for a delta
+		if c.Waiting <= 0 {
+			actRow("run queue", "0", cFaint, false, spark(h.queue, sw, 1, queueCol), qNote)
+		} else {
+			actRow("run queue", fmt.Sprintf("%.0f tasks", c.Waiting), queueCol(c.Waiting), true,
+				spark(h.queue, sw, 1, queueCol), qNote)
+		}
+	} else {
+		metric("run queue", c.HasWaiting || r.Source == "system", c.Waiting,
+			fmt.Sprintf("%.1f tasks", c.Waiting), queueCol, h.queue, 1, qNote)
+	}
+	metric("steal", c.HasSteal || !r.HasRates, c.Steal, fmt.Sprintf("%.1f%%", c.Steal),
+		func(v float64) rgb { return level(v, 1, 5, 15) }, h.steal, 5, "taken by the hypervisor")
+	if r.Source != "system" {
+		metric("throttled", s.CPU.HasThrottle, c.Throttled, fmt.Sprintf("%.0f ms", c.Throttled),
+			func(v float64) rgb { return level(v, 50, 200, 500) }, h.throttle, 100, "held back by cpu.max quota")
+	}
 	f.blank()
 
 	// ── footer

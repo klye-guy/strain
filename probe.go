@@ -45,6 +45,8 @@ type Sample struct {
 
 	SwapIn, SwapOut, Refault, DirectScan uint64 // pages
 	HasSwapIO                            bool
+
+	CPU CPUSample
 }
 
 // Source produces Samples.
@@ -197,6 +199,7 @@ func (systemSource) Probe() (Sample, error) {
 	s.DirectScan = directScan(vm)
 
 	s.Some, s.Full, s.PSIReason, s.HasPSI = readPSI("/proc/pressure/memory")
+	s.CPU = probeCPUSystem()
 	return s, nil
 }
 
@@ -283,6 +286,7 @@ func (c cgroupSource) Probe() (Sample, error) {
 	}
 
 	s.Some, s.Full, s.PSIReason, s.HasPSI = readPSI(at("memory.pressure"))
+	s.CPU = probeCPUCgroup(c.dir)
 	return s, nil
 }
 

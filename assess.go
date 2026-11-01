@@ -17,6 +17,12 @@ func (s State) String() string {
 	return [...]string{"OK", "STRAINED", "PRESSURED", "THRASHING"}[s]
 }
 
+// Severity names the level without tying it to one resource; used for the
+// overall verdict in --check output.
+func (s State) Severity() string {
+	return [...]string{"OK", "WARNING", "CRITICAL", "CRITICAL"}[s]
+}
+
 // Rates are per-second deltas over the sample window, in bytes/s.
 type Rates struct {
 	Window     float64 `json:"window_seconds"`
@@ -42,7 +48,12 @@ type Report struct {
 
 	HasRates bool
 	Rates    Rates
+
+	CPU CPUReport
 }
+
+// Overall is the worse of the memory and CPU verdicts.
+func (r *Report) Overall() State { return max(r.State, r.CPU.State) }
 
 const mib = 1 << 20
 
@@ -58,8 +69,15 @@ func assess(c *config, prev *Sample, cur Sample, source string) *Report {
 	}
 	r.HeadroomLow = r.RealUsed >= 90
 
+	var prevCPU *CPUSample
+	var dt float64
 	if prev != nil {
-		if dt := cur.At.Sub(prev.At).Seconds(); dt > 0.05 {
+		prevCPU, dt = &prev.CPU, cur.At.Sub(prev.At).Seconds()
+	}
+	r.CPU = assessCPU(c, prevCPU, cur.CPU, dt)
+
+	if prev != nil {
+		if dt > 0.05 {
 			ps := float64(pageSize)
 			rate := func(a, b uint64) float64 { return float64(sat(b, a)) * ps / dt }
 			r.HasRates = true
@@ -73,7 +91,7 @@ func assess(c *config, prev *Sample, cur Sample, source string) *Report {
 		}
 	}
 
-	b := c.bands
+	b := c.memBands
 	switch {
 	case cur.HasPSI:
 		r.State = zoneOf(cur.Some.Avg10, b)
@@ -83,13 +101,7 @@ func assess(c *config, prev *Sample, cur Sample, source string) *Report {
 		} else if f >= 2 && r.State < StatePressured {
 			r.State = StatePressured
 		}
-		now, base := cur.Some.Avg10, cur.Some.Avg60
-		switch {
-		case now > base*1.25+0.25:
-			r.Trend = 1
-		case now < base*0.75-0.25:
-			r.Trend = -1
-		}
+		r.Trend = trendOf(cur.Some)
 
 	case r.HasRates:
 		// Fallback: no PSI, so judge by how much data is being paged back
@@ -131,12 +143,12 @@ func explain(r *Report) string {
 	case StateStrained:
 		return "Reclaim is starting to cost a little latency."
 	case StatePressured:
-		return "The working set is pressing against RAM; tasks are waiting."
+		return "Working set is pressing on RAM; tasks are waiting."
 	case StateThrashing:
-		return "The working set no longer fits; time goes to paging, not work."
+		return "Working set exceeds RAM; time goes to paging."
 	}
 	if r.HeadroomLow {
-		return "Headroom is thin, but nothing is waiting on memory yet."
+		return "Headroom is thin, but nothing waits on memory yet."
 	}
-	return "Every memory request is being met without anyone waiting."
+	return "Every memory request is met without anyone waiting."
 }
