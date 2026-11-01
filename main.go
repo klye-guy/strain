@@ -440,8 +440,8 @@ type jsonReport struct {
 	Kernel string     `json:"kernel"`
 	Source string     `json:"source"`
 	Level  string     `json:"level"` // ok · warning · critical (worst of the three)
-	Memory jsonMemory `json:"memory"`
 	CPU    jsonCPU    `json:"cpu"`
+	Memory jsonMemory `json:"memory"`
 	IO     jsonIO     `json:"io"`
 }
 
@@ -516,17 +516,17 @@ func round1(v float64) float64 { return math.Round(v*10) / 10 }
 func checkLine(r *Report, c *config) string {
 	s, cp := r.Sample, r.CPU
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s - memory %s", r.Overall().Severity(), r.State)
-	if s.HasPSI {
-		fmt.Fprintf(&b, " (stall %.1f%%, real used %.0f%%)", s.Some.Avg10, r.RealUsed)
-	} else {
-		fmt.Fprintf(&b, " (estimated, real used %.0f%%)", r.RealUsed)
-	}
-	fmt.Fprintf(&b, ", cpu %s", cpuStateNames[cp.State])
+	fmt.Fprintf(&b, "%s - cpu %s", r.Overall().Severity(), cpuStateNames[cp.State])
 	if s.CPU.HasPSI {
 		fmt.Fprintf(&b, " (stall %.1f%%, busy %.0f%%)", s.CPU.Some.Avg10, cp.Busy)
 	} else {
 		fmt.Fprintf(&b, " (estimated, busy %.0f%%)", cp.Busy)
+	}
+	fmt.Fprintf(&b, ", memory %s", r.State)
+	if s.HasPSI {
+		fmt.Fprintf(&b, " (stall %.1f%%, real used %.0f%%)", s.Some.Avg10, r.RealUsed)
+	} else {
+		fmt.Fprintf(&b, " (estimated, real used %.0f%%)", r.RealUsed)
 	}
 	fmt.Fprintf(&b, ", io %s", ioStateNames[r.IO.State])
 	if s.IO.HasPSI {
@@ -534,12 +534,12 @@ func checkLine(r *Report, c *config) string {
 	} else {
 		b.WriteString(" (estimated)")
 	}
-	fmt.Fprintf(&b, " | mem_stall=%.2f%%;%g;%g mem_stall_full=%.2f%% real_used=%.1f%% demand=%.1f%%",
+	fmt.Fprintf(&b, " | cpu_stall=%.2f%%;%g;%g cpu_busy=%.1f%% cpu_steal=%.1f%% run_queue=%.2f",
+		s.CPU.Some.Avg10, c.cpuBands[0], c.cpuBands[1], cp.Busy, cp.Steal, cp.Waiting)
+	fmt.Fprintf(&b, " mem_stall=%.2f%%;%g;%g mem_stall_full=%.2f%% real_used=%.1f%% demand=%.1f%%",
 		s.Some.Avg10, c.memBands[0], c.memBands[1], s.Full.Avg10, r.RealUsed, r.Demand)
 	fmt.Fprintf(&b, " swap_in=%.0fB refault=%.0fB direct_scan=%.0fB",
 		r.Rates.SwapIn, r.Rates.Refault, r.Rates.DirectScan)
-	fmt.Fprintf(&b, " cpu_stall=%.2f%%;%g;%g cpu_busy=%.1f%% cpu_steal=%.1f%% run_queue=%.2f",
-		s.CPU.Some.Avg10, c.cpuBands[0], c.cpuBands[1], cp.Busy, cp.Steal, cp.Waiting)
 	worstAwait := 0.0
 	for _, d := range r.IO.Disks {
 		worstAwait = max(worstAwait, d.AwaitMs)

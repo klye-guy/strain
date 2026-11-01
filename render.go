@@ -548,62 +548,7 @@ func render(r *Report, v view) []string {
 	f.rule("╭", "╮", title, right)
 	f.blank()
 
-	// ── verdicts
-	f.pressure(pressureBlock{
-		label: "memory", names: [4]string{"OK", "STRAINED", "PRESSURED", "THRASHING"},
-		state: r.State, unknown: r.Estimated && !r.HasRates && !s.HasPSI,
-		hasPSI: s.HasPSI, reason: s.PSIReason, some: s.Some, trend: r.Trend,
-		explain: explain(r), bands: v.MemBands, top: memMeterMax, hist: h.stall,
-		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.Full.Avg10)),
-	}, v)
-	f.blank()
-
-	var waitFig *ln
-	if c.HasWaiting {
-		unit := "avg"
-		if c.WaitApprox {
-			unit = "now"
-		}
-		waitFig = newLn().put(cLabel, "waiting ").bold(cText, fmt.Sprintf("%.1f", c.Waiting)).put(cLabel, " "+unit)
-	}
-	cpuUnknown := !s.CPU.HasPSI && !c.HasWaiting
-	cpuReason := s.CPU.PSIReason
-	if cpuUnknown && !c.HasRates {
-		cpuReason = "measuring…"
-	}
-	f.pressure(pressureBlock{
-		label: "cpu", names: cpuStateNames, state: c.State, unknown: cpuUnknown,
-		hasPSI: s.CPU.HasPSI, reason: cpuReason, some: s.CPU.Some, trend: c.Trend,
-		explain: cpuExplain(&c, s.CPU.HasPSI), bands: v.CPUBands, top: cpuMeterMax,
-		hist: h.cpuStall, figExtra: waitFig,
-	}, v)
-	f.blank()
-
-	io := r.IO
-	ioReason := s.IO.PSIReason
-	ioUnknown := !s.IO.HasPSI && !io.HasRates
-	if ioUnknown {
-		ioReason = "measuring…"
-	}
-	f.pressure(pressureBlock{
-		label: "io", names: ioStateNames, state: io.State, unknown: ioUnknown,
-		hasPSI: s.IO.HasPSI, reason: ioReason, some: s.IO.Some, trend: io.Trend,
-		explain: ioExplain(&io, s.IO.HasPSI), bands: v.IOBands, top: cpuMeterMax,
-		hist:     h.ioStall,
-		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.IO.Full.Avg10)),
-	}, v)
-	f.blank()
-
-	// ── memory capacity
-	capR := newLn().put(cLabel, fmtBytes(float64(s.Total))+" RAM")
-	if r.Source != "system" {
-		if s.Limited {
-			capR = newLn().put(cLabel, "limit "+fmtBytes(float64(s.Total)))
-		} else {
-			capR = newLn().put(cLabel, "no limit · vs host RAM")
-		}
-	}
-	f.rule("├", "┤", newLn().bold(cAccent, "memory capacity"), capR)
+	// ── shared row helpers (capacity-style bars and activity rows)
 	const lw2 = 13
 	bw := min(max(iw-lw2-9-30, 12), 44)
 	noteW := iw - lw2 - bw - 9
@@ -618,26 +563,6 @@ func render(r *Report, v view) []string {
 		l.sp(2).put(cLabel, fit(note, noteW))
 		f.row(l)
 	}
-	capRow("naive used", r.NaiveUsed, cLabel.scale(0.7), "what free and top call used", false)
-	capRow("real used", r.RealUsed, usageColor(r.RealUsed),
-		fmtBytes(float64(s.Available))+" of real headroom", true)
-	demandNote := "nothing parked in swap"
-	if s.SwapUsed > 0 {
-		demandNote = "incl. " + fmtBytes(float64(s.SwapUsed)) + " parked in swap"
-	}
-	capRow("demand", r.Demand, usageColor(r.Demand), demandNote, true)
-
-	det := newLn().to(lw2).put(cLabel, "droppable cache ").put(cText, fmtBytes(float64(s.Droppable))).
-		put(cFaint, "   ·   ").put(cLabel, "swap ")
-	if s.SwapTotal == 0 && s.SwapUsed == 0 {
-		det.put(cText, "none configured")
-	} else {
-		det.put(cText, fmtBytes(float64(s.SwapUsed))).put(cLabel, " of ").put(cText, fmtBytes(float64(s.SwapTotal)))
-	}
-	if det.w <= iw {
-		f.row(det)
-	}
-	f.blank()
 
 	// ── activity rows (shared layout for paging and cpu)
 	const lw3, vw = 16, 11
@@ -683,13 +608,50 @@ func render(r *Report, v view) []string {
 		}
 	}
 
-	f.rule("├", "┤", newLn().bold(cAccent, "paging activity"), newLn().put(cLabel, "per second"))
-	hot := func(v float64) rgb { return rateColor(v, true) }
-	cold := func(v float64) rgb { return rateColor(v, false) }
-	metric("swap-in", s.HasSwapIO, r.Rates.SwapIn, fmtBytes(r.Rates.SwapIn), hot, h.swapIn, mib, "swapped data wanted back")
-	metric("refaults", true, r.Rates.Refault, fmtBytes(r.Rates.Refault), hot, h.refault, mib, "evicted pages needed again")
-	metric("direct reclaim", true, r.Rates.DirectScan, fmtBytes(r.Rates.DirectScan), hot, h.direct, mib, "stalled allocations")
-	metric("swap-out", s.HasSwapIO, r.Rates.SwapOut, fmtBytes(r.Rates.SwapOut), cold, h.swapOut, mib, "idle pages, usually benign")
+	// ── verdicts: cpu, memory, io
+	var waitFig *ln
+	if c.HasWaiting {
+		unit := "avg"
+		if c.WaitApprox {
+			unit = "now"
+		}
+		waitFig = newLn().put(cLabel, "waiting ").bold(cText, fmt.Sprintf("%.1f", c.Waiting)).put(cLabel, " "+unit)
+	}
+	cpuUnknown := !s.CPU.HasPSI && !c.HasWaiting
+	cpuReason := s.CPU.PSIReason
+	if cpuUnknown && !c.HasRates {
+		cpuReason = "measuring…"
+	}
+	f.pressure(pressureBlock{
+		label: "cpu", names: cpuStateNames, state: c.State, unknown: cpuUnknown,
+		hasPSI: s.CPU.HasPSI, reason: cpuReason, some: s.CPU.Some, trend: c.Trend,
+		explain: cpuExplain(&c, s.CPU.HasPSI), bands: v.CPUBands, top: cpuMeterMax,
+		hist: h.cpuStall, figExtra: waitFig,
+	}, v)
+	f.blank()
+
+	f.pressure(pressureBlock{
+		label: "memory", names: [4]string{"OK", "STRAINED", "PRESSURED", "THRASHING"},
+		state: r.State, unknown: r.Estimated && !r.HasRates && !s.HasPSI,
+		hasPSI: s.HasPSI, reason: s.PSIReason, some: s.Some, trend: r.Trend,
+		explain: explain(r), bands: v.MemBands, top: memMeterMax, hist: h.stall,
+		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.Full.Avg10)),
+	}, v)
+	f.blank()
+
+	io := r.IO
+	ioReason := s.IO.PSIReason
+	ioUnknown := !s.IO.HasPSI && !io.HasRates
+	if ioUnknown {
+		ioReason = "measuring…"
+	}
+	f.pressure(pressureBlock{
+		label: "io", names: ioStateNames, state: io.State, unknown: ioUnknown,
+		hasPSI: s.IO.HasPSI, reason: ioReason, some: s.IO.Some, trend: io.Trend,
+		explain: ioExplain(&io, s.IO.HasPSI), bands: v.IOBands, top: cpuMeterMax,
+		hist:     h.ioStall,
+		figExtra: newLn().put(cLabel, "full ").bold(cText, fmt.Sprintf("%.2f%%", s.IO.Full.Avg10)),
+	}, v)
 	f.blank()
 
 	// ── cpu activity
@@ -726,6 +688,46 @@ func render(r *Report, v view) []string {
 		metric("throttled", s.CPU.HasThrottle, c.Throttled, fmt.Sprintf("%.0f ms", c.Throttled),
 			func(v float64) rgb { return level(v, 50, 200, 500) }, h.throttle, 100, "held back by cpu.max quota")
 	}
+	f.blank()
+
+	// ── memory capacity
+	capR := newLn().put(cLabel, fmtBytes(float64(s.Total))+" RAM")
+	if r.Source != "system" {
+		if s.Limited {
+			capR = newLn().put(cLabel, "limit "+fmtBytes(float64(s.Total)))
+		} else {
+			capR = newLn().put(cLabel, "no limit · vs host RAM")
+		}
+	}
+	f.rule("├", "┤", newLn().bold(cAccent, "memory capacity"), capR)
+	capRow("naive used", r.NaiveUsed, cLabel.scale(0.7), "what free and top call used", false)
+	capRow("real used", r.RealUsed, usageColor(r.RealUsed),
+		fmtBytes(float64(s.Available))+" of real headroom", true)
+	demandNote := "nothing parked in swap"
+	if s.SwapUsed > 0 {
+		demandNote = "incl. " + fmtBytes(float64(s.SwapUsed)) + " parked in swap"
+	}
+	capRow("demand", r.Demand, usageColor(r.Demand), demandNote, true)
+
+	det := newLn().to(lw2).put(cLabel, "droppable cache ").put(cText, fmtBytes(float64(s.Droppable))).
+		put(cFaint, "   ·   ").put(cLabel, "swap ")
+	if s.SwapTotal == 0 && s.SwapUsed == 0 {
+		det.put(cText, "none configured")
+	} else {
+		det.put(cText, fmtBytes(float64(s.SwapUsed))).put(cLabel, " of ").put(cText, fmtBytes(float64(s.SwapTotal)))
+	}
+	if det.w <= iw {
+		f.row(det)
+	}
+	f.blank()
+
+	f.rule("├", "┤", newLn().bold(cAccent, "paging activity"), newLn().put(cLabel, "per second"))
+	hot := func(v float64) rgb { return rateColor(v, true) }
+	cold := func(v float64) rgb { return rateColor(v, false) }
+	metric("swap-in", s.HasSwapIO, r.Rates.SwapIn, fmtBytes(r.Rates.SwapIn), hot, h.swapIn, mib, "swapped data wanted back")
+	metric("refaults", true, r.Rates.Refault, fmtBytes(r.Rates.Refault), hot, h.refault, mib, "evicted pages needed again")
+	metric("direct reclaim", true, r.Rates.DirectScan, fmtBytes(r.Rates.DirectScan), hot, h.direct, mib, "stalled allocations")
+	metric("swap-out", s.HasSwapIO, r.Rates.SwapOut, fmtBytes(r.Rates.SwapOut), cold, h.swapOut, mib, "idle pages, usually benign")
 	f.blank()
 
 	// ── disk activity

@@ -184,7 +184,7 @@ PATH is absolute or relative to `/sys/fs/cgroup`.
 
 ## Machine-readable output
 
-`-j` prints one JSON object with `memory`, `cpu` and `io` sections, each
+`-j` prints one JSON object with `cpu`, `memory` and `io` sections, each
 carrying its own `state`, `stall` figures and supporting metrics (`io` lists
 every device that was active during the window, plus an `idle_devices` count). The top-level `level` is `ok`, `warning` or `critical`:
 the worst of the three.
@@ -192,7 +192,7 @@ the worst of the three.
 `--check` prints one line with perfdata after the `|`:
 
 ```
-CRITICAL - memory OK (stall 0.0%, real used 6%), cpu BUSY (stall 6.7%, busy 28%), io SATURATED (stall 49.7%) | mem_stall=0.00%;1;10 …
+CRITICAL - cpu BUSY (stall 6.7%, busy 28%), memory OK (stall 0.0%, real used 6%), io SATURATED (stall 49.7%) | cpu_stall=6.70%;5;20 …
 ```
 
 ## Exit codes
